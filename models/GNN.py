@@ -42,7 +42,7 @@ class GNN(BaseModel):
                               heads=self.heads, feat_drop=self.feat_drop, attn_drop=self.attn_drop).to(self.device)
 
     def init_node_features(self, X, optimize_node_features):
-        node_features = node_features = Variable(X, requires_grad=optimize_node_features)
+        node_features = Variable(X, requires_grad=optimize_node_features)
         return node_features
 
     def fit(self, networkx_graph, X, y, train_mask, val_mask, test_mask, num_epochs,
@@ -62,12 +62,14 @@ class GNN(BaseModel):
         self.hidden_dim = hidden_dim
         self.out_dim = y.shape[1]
 
-        X = self.normalize_features(X, train_mask, val_mask, test_mask)
+
         if len(cat_features):
             X = self.encode_cat_features(X, y, cat_features, train_mask, val_mask, test_mask)
+        X = self.normalize_features(X, train_mask, val_mask, test_mask)
 
         X, y = self.pandas_to_torch(X, y)
         graph = self.networkx_to_torch(networkx_graph)
+
 
         self.init_model()
         node_features = self.init_node_features(X, optimize_node_features)

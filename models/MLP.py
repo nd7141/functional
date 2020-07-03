@@ -97,13 +97,11 @@ class MLP(BaseModel):
         self.hidden_dim = hidden_dim
         self.out_dim = y.shape[1]
 
-        X = self.normalize_features(X, train_mask, val_mask, test_mask)
         if len(cat_features):
             X = self.encode_cat_features(X, y, cat_features, train_mask, val_mask, test_mask)
+        X = self.normalize_features(X, train_mask, val_mask, test_mask)
 
         X, y = self.pandas_to_torch(X, y)
-
-
 
         self.init_model()
         optimizer = self.init_optimizer(node_features=None, optimize_node_features=False,

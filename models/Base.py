@@ -3,8 +3,7 @@ import torch
 from sklearn import preprocessing
 import pandas as pd
 import torch.nn.functional as F
-
-
+import numpy as np
 
 class BaseModel(torch.nn.Module):
     def __init__(self):
@@ -46,15 +45,15 @@ class BaseModel(torch.nn.Module):
         A = X.to_numpy()
         A[train_mask] = min_max_scaler.fit_transform(A[train_mask])
         A[val_mask + test_mask] = min_max_scaler.transform(A[val_mask + test_mask])
-        return pd.DataFrame(A, columns=X.columns)
+        return pd.DataFrame(A, columns=X.columns).astype(float)
 
     def encode_cat_features(self, X, y, cat_features, train_mask, val_mask, test_mask):
         from category_encoders import CatBoostEncoder
         enc = CatBoostEncoder()
         A = X.to_numpy()
         b = y.to_numpy()
-        A[train_mask, cat_features] = enc.fit_transform(A[train_mask, cat_features], b[train_mask])
-        A[val_mask + test_mask, cat_features] = enc.transform(A[val_mask + test_mask, cat_features])
+        A[np.ix_(train_mask, cat_features)] = enc.fit_transform(A[np.ix_(train_mask, cat_features)], b[train_mask])
+        A[np.ix_(val_mask + test_mask, cat_features)] = enc.transform(A[np.ix_(val_mask + test_mask, cat_features)])
         A = A.astype(float)
         return pd.DataFrame(A, columns=X.columns)
 

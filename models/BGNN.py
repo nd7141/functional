@@ -56,7 +56,7 @@ class BGNN(BaseModel):
         epoch_gbdt_model = self.fit_gbdt(pool, gbdt_trees_per_epoch)
         self.gbdt_model = self.append_gbdt_model(epoch_gbdt_model, weights=[1, gbdt_alpha])
 
-    def update_node_features(self, node_features, X):
+    def update_node_features(self, node_features, X, encoded_X):
         predictions = self.gbdt_model.predict(X)
 
         if self.resgnn:
@@ -64,7 +64,7 @@ class BGNN(BaseModel):
                 predictions = np.append(node_features.detach().cpu().data[:, :-1], np.expand_dims(predictions, axis=1),
                                         axis=1)  # append updated X to prediction
             else:
-                predictions = np.append(X, np.expand_dims(predictions, axis=1), axis=1)  # append X to prediction
+                predictions = np.append(encoded_X, np.expand_dims(predictions, axis=1), axis=1)  # append X to prediction
 
         predictions = torch.from_numpy(predictions).to(self.device)
         if len(predictions.shape) == 1:
@@ -106,12 +106,11 @@ class BGNN(BaseModel):
         gbdt_alpha = 1
         self.gbdt_model = None
 
+        encoded_X = X.copy()
         if self.resgnn:
-            encoded_X = self.normalize_features(X, train_mask, val_mask, test_mask)
             if len(cat_features):
-                encoded_X = self.encode_cat_features(X, y, cat_features, train_mask, val_mask, test_mask)
-        else:
-            encoded_X = X.copy()
+                encoded_X = self.encode_cat_features(encoded_X, y, cat_features, train_mask, val_mask, test_mask)
+            encoded_X = self.normalize_features(encoded_X, train_mask, val_mask, test_mask)
 
         node_features = self.init_node_features(encoded_X)
         optimizer = self.init_optimizer(node_features, optimize_node_features=True, learning_rate=learning_rate)
@@ -126,7 +125,7 @@ class BGNN(BaseModel):
             # gbdt part
             self.train_gbdt(gbdt_X_train, gbdt_y_train, cat_features,
                             gbdt_trees_per_epoch, gbdt_alpha)
-            self.update_node_features(node_features, X)
+            self.update_node_features(node_features, X, encoded_X)
 
             # gnn part
             node_features_before = node_features.clone()
