@@ -4,6 +4,7 @@ from sklearn import preprocessing
 import pandas as pd
 import torch.nn.functional as F
 import numpy as np
+from sklearn.metrics import r2_score, accuracy_score
 
 class BaseModel(torch.nn.Module):
     def __init__(self):
@@ -11,14 +12,24 @@ class BaseModel(torch.nn.Module):
         self.device = torch.device('cuda:0' if torch.cuda.is_available() else 'cpu')
 
     def pandas_to_torch(self, *args):
-        return [torch.from_numpy(arg.to_numpy()).float().squeeze().to(self.device) for arg in args]
+        return [torch.from_numpy(arg.to_numpy(copy=True)).float().squeeze().to(self.device) for arg in args]
 
     def networkx_to_torch(self, networkx_graph):
         import dgl
-        graph = dgl.DGLGraph()
-        graph.from_networkx(networkx_graph)
+        # graph = dgl.DGLGraph()
+        graph = dgl.from_networkx(networkx_graph)
+        graph = dgl.remove_self_loop(graph)
+        graph = dgl.add_self_loop(graph)
         graph = graph.to(self.device)
         return graph
+
+    def networkx_to_torch2(self, networkx_graph):
+        from torch_geometric.utils import convert
+        import torch_geometric.transforms as T
+        graph = convert.from_networkx(networkx_graph)
+        transform = T.Compose([T.TargetIndegree()])
+        graph = transform(graph)
+        return graph.to(self.device)
 
     def move_to_device(self, *args):
         return [arg.to(self.device) for arg in args]
@@ -28,56 +39,74 @@ class BaseModel(torch.nn.Module):
         params = [self.model.parameters()]
         if optimize_node_features:
             params.append([node_features])
-        optimizer = torch.optim.AdamW(itertools.chain(*params), lr=learning_rate)
+        optimizer = torch.optim.Adam(itertools.chain(*params), lr=learning_rate)
         return optimizer
 
-    def log_epoch(self, pbar, accuracies, epoch, loss, epoch_time, logging_epochs):
-        train_rmse, val_rmse, test_rmse = accuracies[-1]
+    def log_epoch(self, pbar, metrics, epoch, loss, epoch_time, logging_epochs):
+        train_rmse, val_rmse, test_rmse = metrics['loss'][-1]
         if epoch and epoch % logging_epochs == 0:
             pbar.set_description(
-                "Epoch {:05d} | Loss {:.3f} | RMSE {:.3f}/{:.3f}/{:.3f} | Time {:.4f}".format(epoch, loss,
+                "Epoch {:05d} | Loss {:.3f} | Loss {:.3f}/{:.3f}/{:.3f} | Time {:.4f}".format(epoch, loss,
                                                                                               train_rmse,
                                                                                               val_rmse, test_rmse,
                                                                                               epoch_time))
 
     def normalize_features(self, X, train_mask, val_mask, test_mask):
         min_max_scaler = preprocessing.MinMaxScaler()
-        A = X.to_numpy()
+        A = X.to_numpy(copy=True)
         A[train_mask] = min_max_scaler.fit_transform(A[train_mask])
         A[val_mask + test_mask] = min_max_scaler.transform(A[val_mask + test_mask])
         return pd.DataFrame(A, columns=X.columns).astype(float)
 
+    def replace_na(self, X, train_mask):
+        if X.isna().any().any():
+            return X.fillna(X.iloc[train_mask].min() - 1)
+        return X
+
     def encode_cat_features(self, X, y, cat_features, train_mask, val_mask, test_mask):
         from category_encoders import CatBoostEncoder
         enc = CatBoostEncoder()
-        A = X.to_numpy()
-        b = y.to_numpy()
+        A = X.to_numpy(copy=True)
+        b = y.to_numpy(copy=True)
         A[np.ix_(train_mask, cat_features)] = enc.fit_transform(A[np.ix_(train_mask, cat_features)], b[train_mask])
         A[np.ix_(val_mask + test_mask, cat_features)] = enc.transform(A[np.ix_(val_mask + test_mask, cat_features)])
         A = A.astype(float)
         return pd.DataFrame(A, columns=X.columns)
 
     def train_model(self, model_in, target_labels, train_mask, optimizer):
-        self.model.train()
         y = target_labels[train_mask]
-        logits = self.model(*model_in)[train_mask].squeeze()
 
-        loss = torch.sqrt(F.mse_loss(logits, y))
+        self.model.train()
+        logits = self.model(*model_in).squeeze()
+        pred = logits[train_mask]
+
+        if self.task == 'regression':
+            loss = torch.sqrt(F.mse_loss(pred, y))
+        elif self.task == 'classification':
+            loss = F.cross_entropy(pred, y.long())
+        else:
+            raise NotImplemented("Unknown task. Supported tasks: classification, regression.")
 
         optimizer.zero_grad()
         loss.backward()
         optimizer.step()
         return loss
 
-    def evaluate_model(self, model_in, target_labels, mask):
-        self.model.eval()
+    def evaluate_model(self, logits, target_labels, mask):
         metrics = {}
         y = target_labels[mask]
         with torch.no_grad():
-            pred = self.model(*model_in).squeeze()[mask]
-            metrics['rmse'] = torch.sqrt(F.mse_loss(pred, y).squeeze() + 1e-8)
-            metrics['rmsle'] = torch.sqrt(F.mse_loss(torch.log(pred + 1), torch.log(y + 1)).squeeze() + 1e-8)
-            metrics['mae'] = F.l1_loss(pred, y)
+            # print(logits.shape)
+            pred = logits[mask]
+            if self.task == 'regression':
+                metrics['loss'] = torch.sqrt(F.mse_loss(pred, y).squeeze() + 1e-8)
+                metrics['rmsle'] = torch.sqrt(F.mse_loss(torch.log(pred + 1), torch.log(y + 1)).squeeze() + 1e-8)
+                metrics['mae'] = F.l1_loss(pred, y)
+                metrics['r2'] = -torch.Tensor([r2_score(y.cpu().numpy(), pred.cpu().numpy())])
+            elif self.task == 'classification':
+                metrics['loss'] = F.cross_entropy(pred, y.long())
+                metrics['accuracy'] = -torch.Tensor([(y == pred.max(1)[1]).sum().item()/y.shape[0]])
+
             return metrics
 
     def train_val_test_split(self, X, y, train_mask, val_mask, test_mask):
@@ -87,38 +116,43 @@ class BaseModel(torch.nn.Module):
         return X_train, y_train, X_val, y_val, X_test, y_test
 
     def train_and_evaluate(self, model_in, target_labels, train_mask, val_mask, test_mask,
-                           optimizer, accuracies, gnn_passes_per_epoch):
+                           optimizer, metrics, gnn_passes_per_epoch):
         loss = None
         for _ in range(gnn_passes_per_epoch):
             loss = self.train_model(model_in, target_labels, train_mask, optimizer)
-        train_results = self.evaluate_model(model_in, target_labels, train_mask)
-        val_results = self.evaluate_model(model_in, target_labels, val_mask)
-        test_results = self.evaluate_model(model_in, target_labels, test_mask)
-        accuracies.append((train_results['rmse'].detach().item(),
-                           val_results['rmse'].detach().item(),
-                           test_results['rmse'].detach().item()))
+
+        self.model.eval()
+        logits = self.model(*model_in).squeeze()
+        train_results = self.evaluate_model(logits, target_labels, train_mask)
+        val_results = self.evaluate_model(logits, target_labels, val_mask)
+        test_results = self.evaluate_model(logits, target_labels, test_mask)
+        for metric_name in train_results:
+            metrics[metric_name].append((train_results[metric_name].detach().item(),
+                               val_results[metric_name].detach().item(),
+                               test_results[metric_name].detach().item()
+                               ))
         return loss
 
-    def update_early_stopping(self, accuracies, epoch, min_rmse, min_rmse_epoch, epochs_since_last_min_rmse):
-        train_rmse, val_rmse, test_rmse = accuracies[-1]
-        if val_rmse < min_rmse[1]:
-            min_rmse = accuracies[-1]
-            min_rmse_epoch = epoch
-            epochs_since_last_min_rmse = 0
+    def update_early_stopping(self, metrics, epoch, min_metric, min_val_epoch, epochs_since_last_min_metric, metric_name):
+        train_metric, val_metric, test_metric = metrics[metric_name][-1]
+        if val_metric < min_metric[1]:
+            min_metric = metrics[metric_name][-1]
+            min_val_epoch = epoch
+            epochs_since_last_min_metric = 0
         else:
-            epochs_since_last_min_rmse += 1
-        return min_rmse, min_rmse_epoch, epochs_since_last_min_rmse
+            epochs_since_last_min_metric += 1
+        return min_metric, min_val_epoch, epochs_since_last_min_metric
 
-    def save_accuracies(self, accuracies, fn):
+    def save_metrics(self, metrics, fn):
         with open(fn, "w+") as f:
-            for acc in accuracies:
-                print(*acc, file=f)
+            for key, value in metrics.items():
+                print(key, value, file=f)
 
-    def plot(self, accuracies, legend, title, output_fn=None, logx=False, logy=False):
+    def plot(self, metrics, legend, title, output_fn=None, logx=False, logy=False, metric_name='loss', descending=True):
         import matplotlib.pyplot as plt
-
-        xs = [range(len(accuracies))] * len(accuracies[0])
-        ys = list(zip(*accuracies))
+        metric_results = metrics[metric_name]
+        xs = [range(len(metric_results))] * len(metric_results[0])
+        ys = list(zip(*metric_results))
 
         plt.rcParams.update({'font.size': 40})
         plt.rcParams["figure.figsize"] = (20, 10)
@@ -128,6 +162,8 @@ class BaseModel(torch.nn.Module):
                   (255, 146, 135), (89, 84, 214), (0, 198, 248), (135, 133, 0), (0, 167, 108), (189, 189, 189)]
         colors = [[p / 255 for p in c] for c in colors]
         for i in range(len(ys)):
+            if not descending:
+                ys[i] = -np.array(ys[i])
             plt.plot(xs[i], ys[i], lw=4, color=colors[i])
         plt.legend(legend, loc=1, fontsize=30)
         plt.title(title)
@@ -142,15 +178,18 @@ class BaseModel(torch.nn.Module):
         plt.savefig(output_fn, bbox_inches='tight') if output_fn else None
         plt.show()
 
-    def plot_interactive(self, accuracies, legend, title, logx=False, logy=False):
+    def plot_interactive(self, metrics, legend, title, logx=False, logy=False, metric_name='loss', descending=True,
+                         start_from=0):
         import plotly.graph_objects as go
-
-        xs = [list(range(len(accuracies)))] * len(accuracies[0])
-        ys = list(zip(*accuracies))
+        metric_results = metrics[metric_name]
+        xs = [list(range(len(metric_results)))] * len(metric_results[0])
+        ys = list(zip(*metric_results))
 
         fig = go.Figure()
         for i in range(len(ys)):
-            fig.add_trace(go.Scatter(x=xs[i], y=ys[i],
+            if not descending:
+                ys[i] = -np.array(ys[i])
+            fig.add_trace(go.Scatter(x=xs[i][start_from:], y=ys[i][start_from:],
                                      mode='lines+markers',
                                      name=legend[i]))
 
